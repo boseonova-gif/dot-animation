@@ -2,9 +2,13 @@ export const MAX_COLORS = 7;
 
 export type StylizerSettings = {
   colors: string[];
+  backgroundColor: string;
   shapeDetail: number;
-  motionDetail: number;
   dotSize: number;
+  /** 0 = sparse / spread out, 100 = dense / packed */
+  dotDensity: number;
+  /** 0 = narrow color regions, 100 = wide color regions */
+  colorArea: number;
 };
 
 export const DEFAULT_COLORS = [
@@ -19,9 +23,11 @@ export const DEFAULT_COLORS = [
 
 export const DEFAULT_SETTINGS: StylizerSettings = {
   colors: DEFAULT_COLORS,
+  backgroundColor: "#ffffff",
   shapeDetail: 58,
-  motionDetail: 62,
   dotSize: 72,
+  dotDensity: 62,
+  colorArea: 55,
 };
 
 export type Pebble = {

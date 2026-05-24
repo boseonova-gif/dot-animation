@@ -1,8 +1,34 @@
+import { buildColorIndexPermutation } from "./colorEffects";
 import type { Pebble } from "./types";
-import { hexToRgb, nearestPaletteIndex, type Rgb } from "./colorUtils";
+import {
+  ensurePaletteCoverage,
+  getColorAreaRadiusMultiplier,
+  getColorAssignmentThreshold,
+  getColorExpansionRings,
+  hexToRgb,
+  isBackgroundLike,
+  nearestPaletteMatch,
+  perceptualColorDistance,
+  type Rgb,
+} from "./colorUtils";
 
-function getCellSize(shapeDetail: number) {
-  return Math.max(8, Math.round(30 - shapeDetail * 0.2));
+function getDensityGrid(dotDensity: number) {
+  const amount = Math.max(0, Math.min(100, dotDensity)) / 100;
+  const minCell = 8;
+  const maxCell = 46;
+  const cellSize = Math.round(maxCell - amount * (maxCell - minCell));
+  const rowStep = cellSize * (0.66 + amount * 0.26);
+  return { cellSize, rowStep, amount };
+}
+
+function getShapeParams(shapeDetail: number) {
+  const amount = Math.max(0, Math.min(100, shapeDetail)) / 100;
+  return {
+    jitterMin: 0.84 + amount * 0.06,
+    jitterRange: 0.14 + amount * 0.14,
+    stretchMin: 0.84 + amount * 0.08,
+    stretchRange: 0.16 + amount * 0.14,
+  };
 }
 
 function getConnectStrength(dotSize: number) {
@@ -52,30 +78,166 @@ function pebbleVariation(seed: number) {
   return wave - Math.floor(wave);
 }
 
+function getGridKey(row: number, col: number) {
+  return `${row},${col}`;
+}
+
+function expandColorRegions(
+  pebbles: Pebble[],
+  width: number,
+  height: number,
+  cellSize: number,
+  rowStep: number,
+  colorArea: number,
+  data: Uint8ClampedArray,
+  rgbPalette: Rgb[],
+  backgroundColor: string,
+  assignmentThreshold: number,
+  radiusScale: number,
+  connectStrength: number,
+): Pebble[] {
+  const rings = getColorExpansionRings(colorArea);
+  if (rings === 0 || pebbles.length === 0) return pebbles;
+
+  const occupied = new Map<string, Pebble>();
+  for (const pebble of pebbles) {
+    const col = Math.round((pebble.x - cellSize * 0.5) / cellSize);
+    const row = Math.round((pebble.y - cellSize * 0.5) / rowStep);
+    occupied.set(getGridKey(row, col), pebble);
+  }
+
+  const radiusMult = getColorAreaRadiusMultiplier(colorArea);
+  const next = [...pebbles];
+  const neighborOffsets = [
+    [0, 1],
+    [0, -1],
+    [1, 0],
+    [-1, 0],
+    [1, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+  ];
+
+  for (let ring = 0; ring < rings; ring += 1) {
+    const added: Pebble[] = [];
+
+    for (const [key, source] of occupied) {
+      const [rowText, colText] = key.split(",");
+      const row = Number(rowText);
+      const col = Number(colText);
+
+      for (const [dr, dc] of neighborOffsets) {
+        const nextRow = row + dr;
+        const nextCol = col + dc;
+        const nextKey = getGridKey(nextRow, nextCol);
+        if (occupied.has(nextKey)) continue;
+
+        const rowOffset = nextRow % 2 === 0 ? 0 : cellSize * 0.5;
+        const centerX = nextCol * cellSize + rowOffset + cellSize * 0.5;
+        const centerY = nextRow * rowStep + cellSize * 0.5;
+
+        if (centerX < 0 || centerY < 0 || centerX > width || centerY > height) continue;
+
+        const sampleX = Math.max(0, Math.min(width - 1, Math.round(centerX - cellSize * 0.5)));
+        const sampleY = Math.max(0, Math.min(height - 1, Math.round(centerY - cellSize * 0.5)));
+        const sampleW = Math.min(cellSize, width - sampleX);
+        const sampleH = Math.min(cellSize, height - sampleY);
+        const sampled = sampleCellColor(data, width, height, sampleX, sampleY, sampleW, sampleH);
+
+        if (isBackgroundLike(sampled, backgroundColor)) continue;
+
+        const sourceDistance = perceptualColorDistance(sampled, rgbPalette[source.colorIndex]);
+        const relaxedThreshold = assignmentThreshold * (1.35 + colorArea / 100);
+        if (sourceDistance > relaxedThreshold) continue;
+
+        const seed = nextRow * 997 + nextCol + ring * 131;
+        const sizeJitter = 0.9 + pebbleVariation(seed) * 0.16;
+        const expand = 1 + connectStrength * 1.12;
+        const baseRadius = cellSize * 0.5 * radiusScale * sizeJitter * expand * radiusMult;
+        const stretch = 0.9 + pebbleVariation(seed + 17) * 0.18;
+
+        const pebble = clampPebbleToCanvas(
+          {
+            x: centerX,
+            y: centerY,
+            radiusX: baseRadius,
+            radiusY: baseRadius * stretch,
+            rotation: pebbleVariation(seed + 41) * Math.PI,
+            colorIndex: source.colorIndex,
+          },
+          width,
+          height,
+        );
+
+        added.push(pebble);
+        occupied.set(nextKey, pebble);
+      }
+    }
+
+    next.push(...added);
+  }
+
+  return next;
+}
+
+function clampPebbleToCanvas(pebble: Pebble, width: number, height: number): Pebble {
+  const rx = pebble.radiusX;
+  const ry = pebble.radiusY;
+  return {
+    ...pebble,
+    x: Math.min(width - rx, Math.max(rx, pebble.x)),
+    y: Math.min(height - ry, Math.max(ry, pebble.y)),
+  };
+}
+
+type PebbleCandidate = {
+  x: number;
+  y: number;
+  radiusX: number;
+  radiusY: number;
+  rotation: number;
+  sampled: Rgb;
+  colorIndex: number;
+};
+
 export function buildPebbles(
   imageData: ImageData,
   palette: string[],
   shapeDetail: number,
   dotSize: number,
+  dotDensity: number,
+  backgroundColor: string,
+  colorArea: number,
+  colorDistributionSeed = 0,
 ): Pebble[] {
   const { width, height, data } = imageData;
   const rgbPalette = palette.map(hexToRgb);
-  const cellSize = getCellSize(shapeDetail);
+  const { cellSize, rowStep, amount: densityAmount } = getDensityGrid(dotDensity);
+  const shapeParams = getShapeParams(shapeDetail);
   const radiusScale = getRadiusScale(dotSize);
   const connectStrength = getConnectStrength(dotSize);
-  const pebbles: Pebble[] = [];
+  const assignmentThreshold = getColorAssignmentThreshold(colorArea);
+  const radiusMult = getColorAreaRadiusMultiplier(colorArea);
+  const forceInclude = colorArea >= 88;
+  const useRandomDistribution = colorDistributionSeed !== 0;
+  const indexPermutation = useRandomDistribution
+    ? buildColorIndexPermutation(rgbPalette.length, colorDistributionSeed)
+    : null;
+  const candidates: PebbleCandidate[] = [];
 
   const cols = Math.ceil(width / cellSize) + 1;
-  const rows = Math.ceil(height / cellSize) + 1;
+  const rows = Math.ceil((height + cellSize) / rowStep) + 1;
+  const maxRadiusEstimate = cellSize * 0.5 * radiusScale * 1.35 * (1 + connectStrength * 1.12);
 
   for (let row = 0; row < rows; row += 1) {
     const rowOffset = row % 2 === 0 ? 0 : cellSize * 0.5;
     for (let col = 0; col < cols; col += 1) {
       const centerX = col * cellSize + rowOffset + cellSize * 0.5;
-      const centerY = row * cellSize * 0.86 + cellSize * 0.5;
+      const centerY = row * rowStep + cellSize * 0.5;
 
-      if (centerX < -cellSize * 0.3 || centerY < -cellSize * 0.3) continue;
-      if (centerX > width + cellSize * 0.3 || centerY > height + cellSize * 0.3) continue;
+      if (centerX < -maxRadiusEstimate || centerY < -maxRadiusEstimate) continue;
+      if (centerX > width + maxRadiusEstimate || centerY > height + maxRadiusEstimate) continue;
 
       const sampleX = Math.max(0, Math.min(width - 1, Math.round(centerX - cellSize * 0.5)));
       const sampleY = Math.max(0, Math.min(height - 1, Math.round(centerY - cellSize * 0.5)));
@@ -83,26 +245,80 @@ export function buildPebbles(
       const sampleH = Math.min(cellSize, height - sampleY);
 
       const sampled = sampleCellColor(data, width, height, sampleX, sampleY, sampleW, sampleH);
-      const colorIndex = nearestPaletteIndex(sampled, rgbPalette);
+      if (isBackgroundLike(sampled, backgroundColor)) continue;
+
       const seed = row * 997 + col;
 
-      const sizeJitter = 0.88 + pebbleVariation(seed) * 0.2;
-      const expand = 1 + connectStrength * 1.12;
-      const baseRadius = cellSize * 0.5 * radiusScale * sizeJitter * expand;
-      const stretch = 0.9 + pebbleVariation(seed + 17) * 0.18;
+      const skipChance = (1 - densityAmount) * 0.58;
+      if (pebbleVariation(seed + 311) < skipChance) continue;
 
-      pebbles.push({
+      const sizeJitter =
+        shapeParams.jitterMin + pebbleVariation(seed) * shapeParams.jitterRange;
+      const expand = 1 + connectStrength * 1.12;
+      const baseRadius = cellSize * 0.5 * radiusScale * sizeJitter * expand * radiusMult;
+      const stretch =
+        shapeParams.stretchMin + pebbleVariation(seed + 17) * shapeParams.stretchRange;
+
+      let colorIndex: number;
+      if (useRandomDistribution) {
+        const slot = Math.floor(pebbleVariation(seed + colorDistributionSeed) * rgbPalette.length);
+        colorIndex = indexPermutation?.[slot] ?? slot;
+      } else {
+        const match = nearestPaletteMatch(sampled, rgbPalette);
+        if (!forceInclude && match.distance > assignmentThreshold) continue;
+        colorIndex = match.index;
+      }
+
+      candidates.push({
         x: centerX,
         y: centerY,
         radiusX: baseRadius,
         radiusY: baseRadius * stretch,
         rotation: pebbleVariation(seed + 41) * Math.PI,
+        sampled,
         colorIndex,
       });
     }
   }
 
-  return pebbles;
+  if (candidates.length === 0) return [];
+
+  const initialIndices = candidates.map((candidate) => candidate.colorIndex);
+  const samples = candidates.map((candidate) => candidate.sampled);
+  const balancedIndices =
+    colorArea >= 30
+      ? ensurePaletteCoverage(initialIndices, samples, rgbPalette)
+      : initialIndices;
+
+  const basePebbles = candidates.map((candidate, index) =>
+    clampPebbleToCanvas(
+      {
+        x: candidate.x,
+        y: candidate.y,
+        radiusX: candidate.radiusX,
+        radiusY: candidate.radiusY,
+        rotation: candidate.rotation,
+        colorIndex: balancedIndices[index],
+      },
+      width,
+      height,
+    ),
+  );
+
+  return expandColorRegions(
+    basePebbles,
+    width,
+    height,
+    cellSize,
+    rowStep,
+    colorArea,
+    data,
+    rgbPalette,
+    backgroundColor,
+    assignmentThreshold,
+    radiusScale,
+    connectStrength,
+  );
 }
 
 function drawPebblesByIndex(
@@ -135,11 +351,7 @@ function drawConnectedByIndex(
     groups.set(pebble.colorIndex, group);
   }
 
-  const orderedIndexes = [...groups.keys()].sort((left, right) => {
-    if (left === 0) return -1;
-    if (right === 0) return 1;
-    return left - right;
-  });
+  const orderedIndexes = [...groups.keys()].sort((left, right) => left - right);
 
   for (const colorIndex of orderedIndexes) {
     const group = groups.get(colorIndex);
@@ -167,9 +379,8 @@ export function drawPebbleFrame(
   pebbles: Pebble[],
   palette: string[],
   dotSize: number,
+  backgroundColor: string,
 ) {
-  const backgroundColor = palette[0] ?? "#F5D5CB";
-  ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = backgroundColor;
   ctx.fillRect(0, 0, width, height);
 
@@ -180,33 +391,4 @@ export function drawPebbleFrame(
   }
 
   drawConnectedByIndex(ctx, pebbles, palette);
-}
-
-export function lerpPebbles(
-  previous: Pebble[],
-  current: Pebble[],
-  ratio: number,
-): Pebble[] {
-  if (previous.length === 0 || ratio <= 0) return current;
-  if (previous.length !== current.length) return current;
-
-  return current.map((pebble, index) => {
-    const prev = previous[index];
-    if (!prev || prev.colorIndex !== pebble.colorIndex) return pebble;
-
-    return {
-      colorIndex: pebble.colorIndex,
-      x: prev.x * ratio + pebble.x * (1 - ratio),
-      y: prev.y * ratio + pebble.y * (1 - ratio),
-      radiusX: prev.radiusX * ratio + pebble.radiusX * (1 - ratio),
-      radiusY: prev.radiusY * ratio + pebble.radiusY * (1 - ratio),
-      rotation: prev.rotation * ratio + pebble.rotation * (1 - ratio),
-    };
-  });
-}
-
-export function getMotionBlendRatio(motionDetail: number) {
-  if (motionDetail >= 95) return 0;
-  if (motionDetail <= 5) return 0.55;
-  return ((100 - motionDetail) / 100) * 0.5;
 }

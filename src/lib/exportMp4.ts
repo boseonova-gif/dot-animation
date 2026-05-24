@@ -1,5 +1,5 @@
 import { Muxer, ArrayBufferTarget } from "mp4-muxer";
-import { processVideoFrame, renderProcessedFrame } from "./videoStylizer";
+import { EXPORT_MAX_PROCESS_WIDTH, processVideoFrame, renderProcessedFrame } from "./videoStylizer";
 import type { StylizerSettings } from "./types";
 
 export type ExportProgress = {
@@ -51,9 +51,19 @@ export async function exportAnimationMp4(options: {
   sourceCanvas: HTMLCanvasElement;
   outputCanvas: HTMLCanvasElement;
   settings: StylizerSettings;
+  assignmentPalette: string[];
+  colorDistributionSeed?: number;
   onProgress?: (progress: ExportProgress) => void;
 }): Promise<Blob> {
-  const { video, sourceCanvas, outputCanvas, settings, onProgress } = options;
+  const {
+    video,
+    sourceCanvas,
+    outputCanvas,
+    settings,
+    assignmentPalette,
+    colorDistributionSeed = 0,
+    onProgress,
+  } = options;
 
   if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") {
     throw new Error("MP4 내보내기는 Chrome 또는 Edge에서 지원됩니다.");
@@ -78,9 +88,15 @@ export async function exportAnimationMp4(options: {
   sourceCanvas.width = video.videoWidth;
   sourceCanvas.height = video.videoHeight;
   sourceContext.drawImage(video, 0, 0);
-  const sampleFrame = processVideoFrame(sourceCanvas, settings);
-  const width = sampleFrame.width;
-  const height = sampleFrame.height;
+  const sampleFrame = processVideoFrame(
+    sourceCanvas,
+    settings,
+    assignmentPalette,
+    colorDistributionSeed,
+    { maxProcessWidth: EXPORT_MAX_PROCESS_WIDTH },
+  );
+  const width = sampleFrame.sourceWidth;
+  const height = sampleFrame.sourceHeight;
 
   if (width === 0 || height === 0) {
     throw new Error("출력 크기를 계산할 수 없습니다.");
@@ -123,7 +139,13 @@ export async function exportAnimationMp4(options: {
       sourceCanvas.height = video.videoHeight;
       sourceContext.drawImage(video, 0, 0);
 
-      const processed = processVideoFrame(sourceCanvas, settings);
+      const processed = processVideoFrame(
+        sourceCanvas,
+        settings,
+        assignmentPalette,
+        colorDistributionSeed,
+        { maxProcessWidth: EXPORT_MAX_PROCESS_WIDTH },
+      );
       renderProcessedFrame(outputCanvas, processed, settings, { pixelRatio: 1 });
 
       const timestamp = Math.round((frameIndex * 1_000_000) / fps);

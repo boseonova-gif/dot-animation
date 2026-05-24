@@ -1,48 +1,24 @@
 import {
   buildPebbles,
   drawPebbleFrame,
-  getMotionBlendRatio,
-  lerpPebbles,
 } from "./pebbleProcessor";
-import { hexToRgb, nearestPaletteIndex } from "./colorUtils";
 import { normalizePalette, type ProcessedFrame, type StylizerSettings } from "./types";
 
-const MAX_PROCESS_WIDTH = 1920;
+const PREVIEW_MAX_PROCESS_WIDTH = 960;
+const EXPORT_MAX_PROCESS_WIDTH = 1920;
 
-function quantizeImageData(source: ImageData, palette: string[]): ImageData {
-  const { width, height, data } = source;
-  const rgbPalette = palette.map(hexToRgb);
-  const output = new ImageData(width, height);
-
-  for (let index = 0; index < width * height; index += 1) {
-    const offset = index * 4;
-    const nearest = rgbPalette[nearestPaletteIndex(
-      {
-        r: data[offset],
-        g: data[offset + 1],
-        b: data[offset + 2],
-      },
-      rgbPalette,
-    )];
-    output.data[offset] = nearest.r;
-    output.data[offset + 1] = nearest.g;
-    output.data[offset + 2] = nearest.b;
-    output.data[offset + 3] = 255;
-  }
-
-  return output;
-}
-
-function getProcessDimensions(sourceWidth: number, sourceHeight: number) {
-  if (sourceWidth <= MAX_PROCESS_WIDTH) {
+function getProcessDimensions(
+  sourceWidth: number,
+  sourceHeight: number,
+  maxProcessWidth: number,
+) {
+  if (sourceWidth <= maxProcessWidth) {
     return { width: sourceWidth, height: sourceHeight };
   }
 
-  const scale = MAX_PROCESS_WIDTH / sourceWidth;
-  return {
-    width: MAX_PROCESS_WIDTH,
-    height: Math.max(1, Math.round(sourceHeight * scale)),
-  };
+  const width = maxProcessWidth;
+  const height = Math.max(1, Math.round((sourceHeight / sourceWidth) * width));
+  return { width, height };
 }
 
 let workCanvas: HTMLCanvasElement | null = null;
@@ -61,6 +37,9 @@ function getWorkCanvas(width: number, height: number) {
 export function processVideoFrame(
   sourceCanvas: HTMLCanvasElement,
   settings: StylizerSettings,
+  assignmentPalette: string[],
+  colorDistributionSeed = 0,
+  options?: { maxProcessWidth?: number },
 ): ProcessedFrame {
   const sourceWidth = sourceCanvas.width;
   const sourceHeight = sourceCanvas.height;
@@ -75,7 +54,8 @@ export function processVideoFrame(
     };
   }
 
-  const { width, height } = getProcessDimensions(sourceWidth, sourceHeight);
+  const maxProcessWidth = options?.maxProcessWidth ?? PREVIEW_MAX_PROCESS_WIDTH;
+  const { width, height } = getProcessDimensions(sourceWidth, sourceHeight, maxProcessWidth);
   const canvas = getWorkCanvas(width, height);
   const workContext = canvas.getContext("2d", { willReadFrequently: true });
 
@@ -93,10 +73,17 @@ export function processVideoFrame(
   workContext.imageSmoothingQuality = "high";
   workContext.drawImage(sourceCanvas, 0, 0, width, height);
 
-  const palette = normalizePalette(settings.colors);
   const rawImage = workContext.getImageData(0, 0, width, height);
-  const quantized = quantizeImageData(rawImage, palette);
-  const pebbles = buildPebbles(quantized, palette, settings.shapeDetail, settings.dotSize);
+  const pebbles = buildPebbles(
+    rawImage,
+    normalizePalette(assignmentPalette),
+    settings.shapeDetail,
+    settings.dotSize,
+    settings.dotDensity,
+    settings.backgroundColor,
+    settings.colorArea,
+    colorDistributionSeed,
+  );
 
   return {
     width,
@@ -121,20 +108,23 @@ export function renderProcessedFrame(
     options?.pixelRatio ??
     (typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 3) : 1);
 
-  const bufferWidth = Math.round(frame.width * pixelRatio);
-  const bufferHeight = Math.round(frame.height * pixelRatio);
+  const bufferWidth = Math.round(frame.sourceWidth * pixelRatio);
+  const bufferHeight = Math.round(frame.sourceHeight * pixelRatio);
 
   if (targetCanvas.width !== bufferWidth || targetCanvas.height !== bufferHeight) {
     targetCanvas.width = bufferWidth;
     targetCanvas.height = bufferHeight;
   }
 
-  targetCanvas.style.aspectRatio = `${frame.sourceWidth} / ${frame.sourceHeight}`;
+  const scaleX = frame.sourceWidth / frame.width;
+  const scaleY = frame.sourceHeight / frame.height;
 
   context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
   context.imageSmoothingEnabled = true;
   context.imageSmoothingQuality = "high";
 
+  context.save();
+  context.scale(scaleX, scaleY);
   drawPebbleFrame(
     context,
     frame.width,
@@ -142,21 +132,9 @@ export function renderProcessedFrame(
     frame.pebbles,
     palette,
     settings.dotSize,
+    settings.backgroundColor,
   );
+  context.restore();
 }
 
-export function blendFrames(
-  previous: ProcessedFrame | null,
-  current: ProcessedFrame,
-  motionDetail: number,
-): ProcessedFrame {
-  const blendRatio = getMotionBlendRatio(motionDetail);
-  if (!previous || blendRatio <= 0 || previous.pebbles.length === 0) {
-    return current;
-  }
-
-  return {
-    ...current,
-    pebbles: lerpPebbles(previous.pebbles, current.pebbles, blendRatio),
-  };
-}
+export { EXPORT_MAX_PROCESS_WIDTH, PREVIEW_MAX_PROCESS_WIDTH };

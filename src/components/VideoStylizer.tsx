@@ -2,14 +2,17 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { downloadBlob, exportAnimationMp4 } from "@/lib/exportMp4";
-import { generateFreshPalette } from "@/lib/colorEffects";
-import { extractPaletteFromImageData } from "@/lib/colorUtils";
-import { blendFrames, processVideoFrame, renderProcessedFrame } from "@/lib/videoStylizer";
+import {
+  createColorDistributionSeed,
+  generateFreshPalette,
+  generateRandomBackgroundColor,
+} from "@/lib/colorEffects";
+import { computePreviewSizeForViewport } from "@/lib/previewSize";
+import { extractSourcePaletteFromVideo } from "@/lib/sourcePalette";
+import { PREVIEW_MAX_PROCESS_WIDTH, processVideoFrame, renderProcessedFrame } from "@/lib/videoStylizer";
 import {
   DEFAULT_SETTINGS,
-  MAX_COLORS,
   normalizePalette,
-  type ProcessedFrame,
   type StylizerSettings,
 } from "@/lib/types";
 
@@ -44,35 +47,32 @@ function Slider({
 
 function PreviewPanel({
   label,
-  videoWidth,
-  videoHeight,
+  displayWidth,
+  displayHeight,
   backgroundClass,
+  panelStyle,
   children,
 }: {
   label: string;
-  videoWidth: number;
-  videoHeight: number;
+  displayWidth: number;
+  displayHeight: number;
   backgroundClass: string;
+  panelStyle?: React.CSSProperties;
   children: React.ReactNode;
 }) {
-  const isLandscape = videoWidth >= videoHeight;
-
   return (
-    <div className={`relative min-h-0 overflow-hidden rounded-2xl ${backgroundClass}`}>
+    <div
+      className={`relative shrink-0 rounded-2xl ${backgroundClass}`}
+      style={panelStyle}
+    >
       <span className="absolute left-3 top-3 z-10 rounded-md bg-black/50 px-2 py-0.5 text-[10px] font-medium uppercase tracking-widest text-white/70">
         {label}
       </span>
-      <div className="flex h-full w-full items-center justify-center p-2">
-        <div
-          className="max-h-full max-w-full"
-          style={{
-            aspectRatio: `${videoWidth} / ${videoHeight}`,
-            width: isLandscape ? "100%" : "auto",
-            height: isLandscape ? "auto" : "100%",
-          }}
-        >
-          {children}
-        </div>
+      <div
+        className="relative"
+        style={{ width: displayWidth, height: displayHeight }}
+      >
+        {children}
       </div>
     </div>
   );
@@ -84,21 +84,26 @@ export default function VideoStylizer() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState("");
-  const [videoSize, setVideoSize] = useState({ width: 16, height: 9 });
+  const [previewSize, setPreviewSize] = useState({ width: 320, height: 180 });
+  const [videoAspect, setVideoAspect] = useState({ width: 16, height: 9 });
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState<{ current: number; total: number } | null>(
     null,
   );
+  const [hasRandomDistribution, setHasRandomDistribution] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const sourceCanvasRef = useRef<HTMLCanvasElement>(null);
   const outputCanvasRef = useRef<HTMLCanvasElement>(null);
   const settingsRef = useRef<StylizerSettings>(DEFAULT_SETTINGS);
   const animationRef = useRef<number | null>(null);
-  const previousFrameRef = useRef<ProcessedFrame | null>(null);
+  const recordingPreviewRef = useRef<number | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const previewAreaRef = useRef<HTMLDivElement>(null);
+  const sourcePaletteRef = useRef<string[]>(normalizePalette(DEFAULT_SETTINGS.colors));
+  const colorDistributionSeedRef = useRef(0);
 
   settingsRef.current = settings;
 
@@ -116,6 +121,13 @@ export default function VideoStylizer() {
     }
   }, []);
 
+  const stopRecordingPreview = useCallback(() => {
+    if (recordingPreviewRef.current !== null) {
+      cancelAnimationFrame(recordingPreviewRef.current);
+      recordingPreviewRef.current = null;
+    }
+  }, []);
+
   const loadVideoFromBlob = useCallback(
     async (blob: Blob, mode: SourceMode) => {
       const url = URL.createObjectURL(blob);
@@ -124,8 +136,12 @@ export default function VideoStylizer() {
 
       stopAnimation();
       setIsPlaying(false);
-      previousFrameRef.current = null;
+      colorDistributionSeedRef.current = 0;
+      setHasRandomDistribution(false);
 
+      if (video.srcObject) {
+        video.srcObject = null;
+      }
       video.src = url;
       video.load();
 
@@ -145,14 +161,10 @@ export default function VideoStylizer() {
       });
 
       const canvas = sourceCanvasRef.current;
-      const context = canvas?.getContext("2d", { willReadFrequently: true });
-      if (canvas && context && video.videoWidth > 0) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        context.drawImage(video, 0, 0);
-        setVideoSize({ width: video.videoWidth, height: video.videoHeight });
-        const image = context.getImageData(0, 0, canvas.width, canvas.height);
-        const palette = normalizePalette(extractPaletteFromImageData(image.data, MAX_COLORS));
+      if (canvas && video.videoWidth > 0) {
+        setVideoAspect({ width: video.videoWidth, height: video.videoHeight });
+        const palette = await extractSourcePaletteFromVideo(video, canvas, 0);
+        sourcePaletteRef.current = [...palette];
         setSettings((current) => ({ ...current, colors: palette }));
       }
 
@@ -172,19 +184,28 @@ export default function VideoStylizer() {
     const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
     if (!sourceContext) return;
 
-    sourceCanvas.width = video.videoWidth;
-    sourceCanvas.height = video.videoHeight;
+    if (sourceCanvas.width !== video.videoWidth || sourceCanvas.height !== video.videoHeight) {
+      sourceCanvas.width = video.videoWidth;
+      sourceCanvas.height = video.videoHeight;
+    }
     sourceContext.drawImage(video, 0, 0);
 
-    const processed = processVideoFrame(sourceCanvas, currentSettings);
-    const blended = blendFrames(
-      previousFrameRef.current,
-      processed,
-      currentSettings.motionDetail,
+    const processed = processVideoFrame(
+      sourceCanvas,
+      currentSettings,
+      sourcePaletteRef.current,
+      colorDistributionSeedRef.current,
+      { maxProcessWidth: PREVIEW_MAX_PROCESS_WIDTH },
     );
-    previousFrameRef.current = blended;
-    renderProcessedFrame(outputCanvas, blended, currentSettings);
+    renderProcessedFrame(outputCanvas, processed, currentSettings, { pixelRatio: 1 });
   }, []);
+
+  const recordingPreviewTick = useCallback(() => {
+    renderFrame();
+    if (mediaRecorderRef.current?.state === "recording") {
+      recordingPreviewRef.current = requestAnimationFrame(recordingPreviewTick);
+    }
+  }, [renderFrame]);
 
   const tick = useCallback(() => {
     const video = videoRef.current;
@@ -222,7 +243,6 @@ export default function VideoStylizer() {
     if (!video || sourceMode === "idle") return;
 
     video.currentTime = 0;
-    previousFrameRef.current = null;
     renderFrame();
 
     if (isPlaying) {
@@ -232,12 +252,25 @@ export default function VideoStylizer() {
   }, [isPlaying, renderFrame, sourceMode, tick]);
 
   const handleRandomPalette = useCallback(() => {
+    const seed = Date.now();
     setSettings((current) => ({
       ...current,
-      colors: generateFreshPalette(),
+      colors: generateFreshPalette(seed),
+      backgroundColor: generateRandomBackgroundColor(seed),
     }));
-    previousFrameRef.current = null;
   }, []);
+
+  const handleRandomColorDistribution = useCallback(() => {
+    colorDistributionSeedRef.current = createColorDistributionSeed();
+    setHasRandomDistribution(true);
+    renderFrame();
+  }, [renderFrame]);
+
+  const handleResetColorDistribution = useCallback(() => {
+    colorDistributionSeedRef.current = 0;
+    setHasRandomDistribution(false);
+    renderFrame();
+  }, [renderFrame]);
 
   const handleColorChange = useCallback((index: number, color: string) => {
     setSettings((current) => {
@@ -245,8 +278,24 @@ export default function VideoStylizer() {
       next[index] = color.toLowerCase();
       return { ...current, colors: next };
     });
-    previousFrameRef.current = null;
   }, []);
+
+  const handleRestoreSourcePalette = useCallback(async () => {
+    const video = videoRef.current;
+    const canvas = sourceCanvasRef.current;
+    if (!video || !canvas || sourceMode === "idle") return;
+
+    try {
+      const palette = await extractSourcePaletteFromVideo(video, canvas, 0);
+      sourcePaletteRef.current = [...palette];
+      colorDistributionSeedRef.current = 0;
+      setHasRandomDistribution(false);
+      setSettings((current) => ({ ...current, colors: palette }));
+      renderFrame();
+    } catch {
+      setStatus("원본 영상에서 컬러를 추출하지 못했습니다.");
+    }
+  }, [renderFrame, sourceMode]);
 
   const handleUpload = useCallback(
     async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -264,11 +313,11 @@ export default function VideoStylizer() {
   );
 
   const stopRecording = useCallback(() => {
+    stopRecordingPreview();
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") recorder.stop();
-    mediaRecorderRef.current?.stream.getTracks().forEach((track) => track.stop());
     setIsRecording(false);
-  }, []);
+  }, [stopRecordingPreview]);
 
   const startRecording = useCallback(async () => {
     if (isRecording) {
@@ -277,10 +326,24 @@ export default function VideoStylizer() {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user" },
         audio: false,
       });
+
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        await video.play();
+
+        const syncAspect = () => {
+          if (video.videoWidth > 0) {
+            setVideoAspect({ width: video.videoWidth, height: video.videoHeight });
+          }
+        };
+        if (video.videoWidth > 0) syncAspect();
+        else video.addEventListener("loadedmetadata", syncAspect, { once: true });
+      }
 
       recordedChunksRef.current = [];
       const recorder = new MediaRecorder(stream, {
@@ -294,6 +357,8 @@ export default function VideoStylizer() {
       };
 
       recorder.onstop = async () => {
+        stopRecordingPreview();
+        if (videoRef.current) videoRef.current.srcObject = null;
         stream.getTracks().forEach((track) => track.stop());
         const blob = new Blob(recordedChunksRef.current, { type: "video/webm" });
         try {
@@ -306,11 +371,12 @@ export default function VideoStylizer() {
       mediaRecorderRef.current = recorder;
       recorder.start();
       setIsRecording(true);
+      recordingPreviewRef.current = requestAnimationFrame(recordingPreviewTick);
     } catch {
-      setStatus("화면 녹화 권한이 거부되었습니다.");
+      setStatus("카메라 권한이 거부되었습니다.");
       setIsRecording(false);
     }
-  }, [isRecording, loadVideoFromBlob, stopRecording]);
+  }, [isRecording, loadVideoFromBlob, recordingPreviewTick, stopRecording, stopRecordingPreview]);
 
   const handleExportMp4 = useCallback(async () => {
     const video = videoRef.current;
@@ -328,11 +394,12 @@ export default function VideoStylizer() {
         sourceCanvas,
         outputCanvas,
         settings: settingsRef.current,
+        assignmentPalette: sourcePaletteRef.current,
+        colorDistributionSeed: colorDistributionSeedRef.current,
         onProgress: setExportProgress,
       });
       downloadBlob(blob, `blob-animation-${Date.now()}.mp4`);
       setStatus("MP4 내보내기가 완료되었습니다.");
-      previousFrameRef.current = null;
       renderFrame();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "MP4 내보내기에 실패했습니다.");
@@ -343,42 +410,85 @@ export default function VideoStylizer() {
   }, [renderFrame, sourceMode]);
 
   useEffect(() => {
-    if (sourceMode !== "idle") {
+    const previewArea = previewAreaRef.current;
+    if (!previewArea) return;
+
+    const updatePreviewSize = () => {
+      const { width, height } = previewArea.getBoundingClientRect();
+      if (width <= 0 || height <= 0) return;
+
+      setPreviewSize(
+        computePreviewSizeForViewport(
+          videoAspect.width,
+          videoAspect.height,
+          width,
+          height,
+        ),
+      );
+    };
+
+    updatePreviewSize();
+    const observer = new ResizeObserver(updatePreviewSize);
+    observer.observe(previewArea);
+    window.addEventListener("resize", updatePreviewSize);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updatePreviewSize);
+    };
+  }, [videoAspect]);
+
+  useEffect(() => {
+    if ((sourceMode !== "idle" || isRecording) && !isPlaying) {
       renderFrame();
     }
-  }, [settings, sourceMode, renderFrame]);
+  }, [settings, sourceMode, isRecording, isPlaying, renderFrame]);
 
   useEffect(() => {
     return () => {
       stopAnimation();
-      stopRecording();
+      stopRecordingPreview();
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== "inactive") recorder.stop();
+      mediaRecorderRef.current?.stream.getTracks().forEach((track) => track.stop());
+      if (videoRef.current?.srcObject) videoRef.current.srcObject = null;
     };
-  }, [stopAnimation, stopRecording]);
+  }, [stopAnimation, stopRecordingPreview]);
 
   const hasSource = sourceMode !== "idle";
+  const showPreview = hasSource || isRecording;
 
   return (
     <div className="flex h-screen flex-col bg-neutral-50 text-neutral-900">
-      <div className="relative flex min-h-0 flex-1 flex-col p-3 sm:p-4">
-        <div className="grid min-h-0 flex-1 grid-cols-2 gap-2 sm:gap-3">
+      <div
+        ref={previewAreaRef}
+        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-3 pt-3 sm:px-4 sm:pt-4"
+      >
+        <div className="flex items-center justify-center gap-2 sm:gap-3">
           <PreviewPanel
-            label="Original"
-            videoWidth={videoSize.width}
-            videoHeight={videoSize.height}
+            label={isRecording ? "Recording" : "Original"}
+            displayWidth={previewSize.width}
+            displayHeight={previewSize.height}
             backgroundClass="bg-neutral-900"
           >
-            <div className="relative h-full w-full">
+            <div className="relative size-full overflow-hidden">
               <video
                 ref={videoRef}
-                className={`h-full w-full ${hasSource ? "block" : "hidden"}`}
+                className={`size-full object-contain ${showPreview ? "block" : "hidden"}`}
                 playsInline
                 muted
-                loop
+                loop={hasSource}
                 onPlay={() => setIsPlaying(true)}
                 onPause={() => setIsPlaying(false)}
               />
-              {!hasSource && (
-                <div className="flex h-full w-full items-center justify-center text-sm text-neutral-500">
+              {isRecording && (
+                <span className="absolute right-3 top-3 z-10 flex items-center gap-1.5 rounded-md bg-red-500/90 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-white">
+                  <span className="size-1.5 animate-pulse rounded-full bg-white" />
+                  Rec
+                </span>
+              )}
+              {!showPreview && (
+                <div className="flex size-full items-center justify-center text-sm text-neutral-500">
                   원본 영상
                 </div>
               )}
@@ -387,14 +497,15 @@ export default function VideoStylizer() {
 
           <PreviewPanel
             label="Animation"
-            videoWidth={videoSize.width}
-            videoHeight={videoSize.height}
-            backgroundClass="bg-[#F5D5CB]"
+            displayWidth={previewSize.width}
+            displayHeight={previewSize.height}
+            backgroundClass=""
+            panelStyle={{ backgroundColor: settings.backgroundColor }}
           >
-            {hasSource ? (
-              <canvas ref={outputCanvasRef} className="block h-full w-full" />
+            {showPreview ? (
+              <canvas ref={outputCanvasRef} className="block size-full object-contain" />
             ) : (
-              <div className="flex h-full w-full items-center justify-center text-sm text-neutral-500">
+              <div className="flex size-full items-center justify-center text-sm text-neutral-500">
                 변환 결과
               </div>
             )}
@@ -402,12 +513,16 @@ export default function VideoStylizer() {
         </div>
 
         {status && (
-          <p className={`mt-2 text-center text-xs ${status.includes("완료") ? "text-neutral-500" : "text-red-500"}`}>
+          <p
+            className={`pointer-events-none absolute bottom-2 left-0 right-0 text-center text-xs ${
+              status.includes("완료") ? "text-neutral-500" : "text-red-500"
+            }`}
+          >
             {status}
           </p>
         )}
         {exportProgress && (
-          <p className="mt-1 text-center text-xs text-neutral-500">
+          <p className="pointer-events-none absolute bottom-2 left-0 right-0 text-center text-xs text-neutral-500">
             내보내기 {exportProgress.current}/{exportProgress.total} 프레임
           </p>
         )}
@@ -456,7 +571,7 @@ export default function VideoStylizer() {
                 : "text-neutral-600 hover:bg-neutral-100"
             }`}
           >
-            {isRecording ? "Stop Rec" : "Record"}
+            {isRecording ? "녹화 중지" : "카메라"}
           </button>
           <input
             ref={fileInputRef}
@@ -474,14 +589,19 @@ export default function VideoStylizer() {
             onChange={(v) => updateSetting("shapeDetail", v)}
           />
           <Slider
-            label="모션"
-            value={settings.motionDetail}
-            onChange={(v) => updateSetting("motionDetail", v)}
-          />
-          <Slider
             label="도트 크기"
             value={settings.dotSize}
             onChange={(v) => updateSetting("dotSize", v)}
+          />
+          <Slider
+            label="밀집도"
+            value={settings.dotDensity}
+            onChange={(v) => updateSetting("dotDensity", v)}
+          />
+          <Slider
+            label="컬러 면적"
+            value={settings.colorArea}
+            onChange={(v) => updateSetting("colorArea", v)}
           />
         </div>
 
@@ -502,11 +622,74 @@ export default function VideoStylizer() {
 
           <button
             type="button"
+            disabled={!hasSource}
+            onClick={handleRestoreSourcePalette}
+            className="rounded-lg border border-neutral-200 px-3 py-1.5 text-xs text-neutral-600 hover:bg-neutral-50 disabled:opacity-30"
+          >
+            원본 컬러
+          </button>
+
+          <button
+            type="button"
             onClick={handleRandomPalette}
             className="rounded-lg border border-neutral-200 px-3 py-1.5 text-xs text-neutral-600 hover:bg-neutral-50"
           >
             랜덤 컬러
           </button>
+
+          <button
+            type="button"
+            disabled={!hasSource}
+            onClick={handleRandomColorDistribution}
+            className="rounded-lg border border-neutral-200 px-3 py-1.5 text-xs text-neutral-600 hover:bg-neutral-50 disabled:opacity-30"
+          >
+            랜덤 면적
+          </button>
+
+          <button
+            type="button"
+            disabled={!hasSource || !hasRandomDistribution}
+            onClick={handleResetColorDistribution}
+            className="rounded-lg border border-neutral-200 px-3 py-1.5 text-xs text-neutral-600 hover:bg-neutral-50 disabled:opacity-30"
+          >
+            면적 초기화
+          </button>
+
+          <div className="mx-1 h-4 w-px bg-neutral-200" />
+
+          <div className="flex items-center gap-1.5">
+            <span className="text-[10px] text-neutral-400">배경</span>
+            <input
+              type="color"
+              value={settings.backgroundColor}
+              onChange={(event) => {
+                updateSetting("backgroundColor", event.target.value.toLowerCase());
+              }}
+              className="h-7 w-7 cursor-pointer appearance-none rounded-full border-2 border-white bg-transparent shadow-sm ring-1 ring-neutral-200"
+            />
+            <button
+              type="button"
+              onClick={() => updateSetting("backgroundColor", "#ffffff")}
+              className={`rounded-lg border px-2 py-1 text-[10px] ${
+                settings.backgroundColor === "#ffffff"
+                  ? "border-neutral-900 bg-neutral-900 text-white"
+                  : "border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+              }`}
+            >
+              W
+            </button>
+            <button
+              type="button"
+              onClick={() => updateSetting("backgroundColor", "#000000")}
+              className={`rounded-lg border px-2 py-1 text-[10px] ${
+                settings.backgroundColor === "#000000"
+                  ? "border-neutral-900 bg-neutral-900 text-white"
+                  : "border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+              }`}
+            >
+              B
+            </button>
+          </div>
         </div>
       </div>
 

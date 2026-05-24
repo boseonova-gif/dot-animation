@@ -35,6 +35,16 @@ function luminance(hex: string) {
   return r * 0.299 + g * 0.587 + b * 0.114;
 }
 
+export function generateRandomBackgroundColor(seed = Date.now()): string {
+  const useDark = seededRandom(seed + 99) > 0.5;
+  const hue = seededRandom(seed + 100) * 360;
+  const saturation = 5 + seededRandom(seed + 101) * 30;
+  const lightness = useDark
+    ? 5 + seededRandom(seed + 102) * 14
+    : 86 + seededRandom(seed + 102) * 12;
+  return hslToHex(hue, saturation, lightness);
+}
+
 export function generateFreshPalette(seed = Date.now()): string[] {
   const colors: string[] = [];
   const baseHue = seededRandom(seed) * 360;
@@ -56,4 +66,20 @@ export function generateFreshPalette(seed = Date.now()): string[] {
   }
 
   return colors.sort((left, right) => luminance(right) - luminance(left));
+}
+
+export function createColorDistributionSeed() {
+  return Date.now() + Math.floor(Math.random() * 1_000_000);
+}
+
+/** Randomly reorders palette slot indices for area assignment. */
+export function buildColorIndexPermutation(length: number, seed: number): number[] {
+  const order = Array.from({ length }, (_, index) => index);
+  for (let index = order.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(seededRandom(seed + index * 17) * (index + 1));
+    const current = order[index];
+    order[index] = order[swapIndex];
+    order[swapIndex] = current;
+  }
+  return order;
 }
